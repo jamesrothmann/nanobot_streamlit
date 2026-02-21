@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import json
 import os
+import random
 from typing import Any, Callable
 
 import litellm
@@ -141,8 +142,31 @@ async def chat_completion(
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
 
-    response = await litellm.acompletion(**kwargs)
-    return response
+    max_retries = int(st.secrets.get("llm", {}).get("max_retries", 3))
+    base_delay = float(st.secrets.get("llm", {}).get("retry_base_delay", 1.0))
+    retryable_status_codes = {429, 500, 502, 503, 504}
+
+    last_err: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await litellm.acompletion(**kwargs)
+        except Exception as exc:
+            last_err = exc
+            status = getattr(exc, "status_code", None)
+            should_retry = (status in retryable_status_codes) or isinstance(
+                exc, (TimeoutError, ConnectionError)
+            )
+            if attempt >= max_retries or not should_retry:
+                raise
+
+            backoff = min(base_delay * (2 ** attempt), 20.0)
+            jitter = random.uniform(0, backoff * 0.1)
+            await asyncio.sleep(backoff + jitter)
+
+    # Unreachable guard
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("chat_completion failed without an exception.")
 
 
 def extract_response(response: Any) -> tuple[str | None, list[dict[str, Any]]]:

@@ -7,6 +7,7 @@ docstrings precise - they become the tool descriptions the LLM sees.
 """
 
 import asyncio
+from contextvars import ContextVar
 import os
 import re
 import shlex
@@ -22,6 +23,9 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+TASK_COMPLETE_PREFIX = "TASK COMPLETE:"
+_SESSION_ID_CTX: ContextVar[str] = ContextVar("nanobot_session_id", default="default")
+_TODOS_BY_SESSION: dict[str, list[dict[str, str]]] = {}
 
 # Commands that are never allowed
 _BLOCKED = re.compile(
@@ -51,6 +55,68 @@ def _get_system_secret(secret_key: str, env_key: str = "") -> str:
 
 def _looks_like_url(value: str) -> bool:
     return bool(_URL_RE.match((value or "").strip()))
+
+
+def _set_active_session_id(session_id: str) -> None:
+    """
+    Bind tool execution to a session id for session-scoped agent state.
+    """
+    _SESSION_ID_CTX.set((session_id or "default").strip() or "default")
+
+
+def _active_session_id() -> str:
+    return _SESSION_ID_CTX.get()
+
+
+def _parse_todo_item(item: str) -> dict[str, str]:
+    text = (item or "").strip()
+    status = "pending"
+    content = text
+
+    prefix_map = {
+        "[ ]": "pending",
+        "[>]": "in_progress",
+        "[x]": "completed",
+    }
+    for prefix, mapped in prefix_map.items():
+        if text.lower().startswith(prefix):
+            status = mapped
+            content = text[len(prefix):].strip()
+            break
+
+    if not content:
+        content = "(empty task)"
+    return {"content": content, "status": status}
+
+
+def _format_todos(session_id: str) -> str:
+    todos = _TODOS_BY_SESSION.get(session_id, [])
+    if not todos:
+        return "Todo list is empty."
+
+    label = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+    lines: list[str] = []
+    for i, item in enumerate(todos, 1):
+        status = item.get("status", "pending")
+        lines.append(f"{i}. {label.get(status, '[ ]')} {item.get('content', '')}")
+    return "\n".join(lines)
+
+
+def _todo_stats(session_id: str) -> tuple[int, int, int]:
+    todos = _TODOS_BY_SESSION.get(session_id, [])
+    pending = sum(1 for t in todos if t.get("status") == "pending")
+    in_progress = sum(1 for t in todos if t.get("status") == "in_progress")
+    completed = sum(1 for t in todos if t.get("status") == "completed")
+    return pending, in_progress, completed
+
+
+def _has_incomplete_todos(session_id: str) -> bool:
+    pending, in_progress, _ = _todo_stats(session_id)
+    return (pending + in_progress) > 0
+
+
+def _session_has_incomplete_todos() -> bool:
+    return _has_incomplete_todos(_active_session_id())
 
 
 # ---------------------------------------------------------------------------
@@ -484,7 +550,7 @@ def _run_agent_browser(cdp_url: str, command: str, timeout: int) -> str:
             return f"Exit code {result.returncode}\n{output}"
         return output
     except subprocess.TimeoutExpired:
-            return f"Error: agent-browser command timed out after {timeout}s."
+        return f"Error: agent-browser command timed out after {timeout}s."
     except Exception as exc:
         return f"Error running agent-browser command: {exc}"
 
@@ -662,6 +728,49 @@ async def browse_jina_then_steel(
         f"Notes:\n{note_block}\n\n"
         f"{output_block}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Agentic task-state tools (browser-use style)
+# ---------------------------------------------------------------------------
+
+async def todo_read() -> str:
+    """
+    Read the current session-scoped todo list.
+    """
+    return _format_todos(_active_session_id())
+
+
+async def todo_write(items: list[str]) -> str:
+    """
+    Replace the current todo list for this session.
+
+    Each item can start with a status prefix:
+    - [ ] pending
+    - [>] in_progress
+    - [x] completed
+
+    :param items: Todo lines, e.g. ['[>] research docs', '[ ] draft summary'].
+    """
+    session_id = _active_session_id()
+    parsed = [_parse_todo_item(item) for item in items if str(item).strip()]
+    _TODOS_BY_SESSION[session_id] = parsed
+
+    pending, in_progress, completed = _todo_stats(session_id)
+    body = _format_todos(session_id)
+    return (
+        f"Todos updated: {pending} pending, {in_progress} in progress, {completed} completed.\n\n"
+        f"{body}"
+    )
+
+
+async def done(message: str) -> str:
+    """
+    Signal that the current task is complete.
+
+    :param message: Final completion summary.
+    """
+    return f"{TASK_COMPLETE_PREFIX} {message}".strip()
 
 
 # ---------------------------------------------------------------------------
