@@ -7,7 +7,7 @@ Architecture:
   - Shares no state with Streamlit's main thread (all state is in Drive/Session).
 
 Security:
-  - Only Telegram usernames listed in secrets["telegram"]["allowed_users"] are served.
+  - Only Telegram identities listed in secrets["telegram"] allow-lists are served.
   - All other senders receive a polite rejection message.
 """
 
@@ -79,10 +79,24 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------------------------------------------------------------------------
 
 def _is_allowed(update: Update) -> bool:
-    """Return True if the sender is in the allowed users list."""
-    allowed: list[str] = list(st.secrets["telegram"].get("allowed_users", []))
-    username = (update.effective_user.username or "").lstrip("@")
-    return username in allowed
+    """
+    Return True if sender is in configured allow-lists.
+
+    Supports:
+      telegram.allowed_users: ["username_without_at", ...]
+      telegram.allowed_user_ids: [123456789, ...]
+    """
+    tg = dict(st.secrets.get("telegram", {}))
+
+    allowed_users = {str(u).lstrip("@").strip() for u in tg.get("allowed_users", []) if str(u).strip()}
+    allowed_ids = {str(i).strip() for i in tg.get("allowed_user_ids", []) if str(i).strip()}
+
+    username = (update.effective_user.username or "").lstrip("@").strip()
+    user_id = str(update.effective_user.id or "").strip()
+
+    if not allowed_users and not allowed_ids:
+        return False
+    return (username in allowed_users) or (user_id in allowed_ids)
 
 
 def _split_message(text: str, max_len: int = 4000) -> list[str]:
@@ -105,7 +119,15 @@ def run_bot() -> None:
     Build and start the Telegram bot with long-polling.
     This function blocks indefinitely and should be run in a daemon thread.
     """
-    token: str = st.secrets["telegram"]["token"]
+    tg = dict(st.secrets.get("telegram", {}))
+    enabled = bool(tg.get("enabled", True))
+    token = str(tg.get("token", "")).strip()
+    if not enabled:
+        logger.info("Telegram bot disabled by config.")
+        return
+    if not token:
+        logger.info("Telegram token not configured; bot not started.")
+        return
 
     # Create a dedicated event loop for this thread
     loop = asyncio.new_event_loop()

@@ -85,12 +85,16 @@ def _boot() -> bool:
     except Exception:
         pass
 
-    # Start Telegram bot in a background daemon thread
+    # Start Telegram bot in a background daemon thread (optional)
     try:
-        import telegram_bot
+        tg = dict(st.secrets.get("telegram", {}))
+        tg_enabled = bool(tg.get("enabled", True))
+        tg_token = str(tg.get("token", "")).strip()
+        if tg_enabled and tg_token:
+            import telegram_bot
 
-        t = threading.Thread(target=telegram_bot.run_bot, daemon=True, name="telegram-bot")
-        t.start()
+            t = threading.Thread(target=telegram_bot.run_bot, daemon=True, name="telegram-bot")
+            t.start()
     except Exception as exc:
         # Telegram failures shouldn't crash the web UI
         st.warning(f"Telegram bot failed to start: {exc}")
@@ -140,6 +144,18 @@ with st.sidebar:
     import memory as mem_module
     if st.button("Show MEMORY.md"):
         st.text_area("MEMORY.md", mem_module.read_memory(), height=300)
+
+    st.divider()
+    st.header("Integrations")
+    tg = dict(st.secrets.get("telegram", {}))
+    tg_enabled = bool(tg.get("enabled", True))
+    tg_configured = bool(str(tg.get("token", "")).strip())
+    if tg_enabled and tg_configured:
+        st.write("Telegram: configured")
+    elif tg_enabled and not tg_configured:
+        st.write("Telegram: enabled but missing token")
+    else:
+        st.write("Telegram: disabled")
 
 # Render existing conversation
 for msg in st.session_state["messages"]:

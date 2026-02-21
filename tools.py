@@ -453,8 +453,14 @@ async def _steel_close_session_request(session_id: str) -> tuple[bool, str | Non
 
 
 def _run_agent_browser(cdp_url: str, command: str, timeout: int) -> str:
-    if not shutil.which("agent-browser"):
-        return "Error: 'agent-browser' CLI is not installed or not in PATH."
+    runner: list[str] | None = None
+    if shutil.which("agent-browser"):
+        runner = ["agent-browser"]
+    elif shutil.which("npx"):
+        # Community Cloud may only have Node tooling available via npx.
+        runner = ["npx", "-y", "agent-browser"]
+    if runner is None:
+        return "Error: neither 'agent-browser' nor 'npx' is available in PATH."
     if _BLOCKED.search(command):
         return f"Error: command blocked for safety: {command!r}"
 
@@ -465,7 +471,7 @@ def _run_agent_browser(cdp_url: str, command: str, timeout: int) -> str:
 
     try:
         result = subprocess.run(
-            ["agent-browser", "--cdp", cdp_url, *cmd_parts],
+            [*runner, "--cdp", cdp_url, *cmd_parts],
             capture_output=True,
             text=True,
             timeout=max(timeout, 1),
@@ -478,7 +484,7 @@ def _run_agent_browser(cdp_url: str, command: str, timeout: int) -> str:
             return f"Exit code {result.returncode}\n{output}"
         return output
     except subprocess.TimeoutExpired:
-        return f"Error: agent-browser command timed out after {timeout}s."
+            return f"Error: agent-browser command timed out after {timeout}s."
     except Exception as exc:
         return f"Error running agent-browser command: {exc}"
 
