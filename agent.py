@@ -21,7 +21,13 @@ import tools as tools_module
 import gworkspace as gworkspace_module
 from session import Session
 
-MAX_TOOL_ITERATIONS = 10
+MAX_TOOL_ITERATIONS = 25
+MAX_ITERATIONS_SUMMARY_PROMPT = """The task reached the maximum number of tool iterations.
+Provide a concise summary with:
+1) What was accomplished
+2) What remains incomplete
+3) Recommended next action
+Keep it brief and actionable."""
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +73,8 @@ class Agent:
 
         :param user_message: The raw text message from the user.
         """
+        tools_module._set_active_session_id(self.session.session_id)
+
         # Persist user message
         self.session.add_message("user", user_message)
 
@@ -76,12 +84,31 @@ class Agent:
             {"role": "system", "content": system_prompt},
             *self.session.get_messages(),
         ]
+        incomplete_todos_prompted = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
             response = await llm_module.chat_completion(messages, tools=_TOOL_SCHEMAS)
             text, tool_calls = llm_module.extract_response(response)
 
             if not tool_calls:
+                # If there are unfinished todos, give the model one hidden chance
+                # to continue before finalizing.
+                if (
+                    not incomplete_todos_prompted
+                    and tools_module._session_has_incomplete_todos()
+                ):
+                    incomplete_todos_prompted = True
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "You still have incomplete todos. Continue working, "
+                                "update the todo list, and call done() only when finished."
+                            ),
+                        }
+                    )
+                    continue
+
                 # Final text response
                 final_text = text or "(no response)"
                 self.session.add_message("assistant", final_text)
@@ -123,8 +150,14 @@ class Agent:
                 messages.append(tool_result_msg)
                 self.session.add_tool_result(tc["id"], tc["name"], str(result))
 
-        # Safety net: shouldn't normally reach here
-        return "I reached the maximum number of tool iterations without a final answer."
+                done_text = _extract_done_message(tc["name"], str(result))
+                if done_text is not None:
+                    self.session.add_message("assistant", done_text)
+                    return done_text
+
+        final_text = await _summarize_max_iterations(messages)
+        self.session.add_message("assistant", final_text)
+        return final_text
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +181,33 @@ async def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
         return f"Error calling tool '{name}': {exc}"
     except Exception as exc:
         return f"Tool '{name}' raised an error: {exc}"
+
+
+def _extract_done_message(tool_name: str, result: str) -> str | None:
+    """
+    Extract final completion text when the done tool is used.
+    """
+    prefix = tools_module.TASK_COMPLETE_PREFIX
+    text = (result or "").strip()
+    if tool_name == "done" and text.startswith(prefix):
+        final = text[len(prefix):].strip()
+        return final or "Task completed."
+    return None
+
+
+async def _summarize_max_iterations(messages: list[dict[str, Any]]) -> str:
+    """
+    Ask the model for a compact progress summary when iteration limit is hit.
+    """
+    summary_messages = [*messages, {"role": "user", "content": MAX_ITERATIONS_SUMMARY_PROMPT}]
+    try:
+        response = await llm_module.chat_completion(summary_messages, tools=None)
+        text, _ = llm_module.extract_response(response)
+        if text and text.strip():
+            return f"[Max iterations reached]\n\n{text.strip()}"
+    except Exception:
+        pass
+    return "I reached the maximum number of tool iterations without a final answer."
 
 
 def _safe_json(obj: Any) -> str:

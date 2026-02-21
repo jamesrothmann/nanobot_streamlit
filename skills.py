@@ -17,10 +17,27 @@ from pathlib import Path
 
 # Skills are stored under /tmp/workspace/skills/
 SKILLS_DIR = Path("/tmp/workspace/skills")
+BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
 
 
 def _ensure_skills_dir() -> None:
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _seed_builtin_skills() -> None:
+    """
+    Copy bundled skill Markdown files into the local cache when missing.
+
+    Built-ins are intentionally one-way seeded so user-managed skill files in
+    Drive can override/edit them without being clobbered on every boot.
+    """
+    if not BUILTIN_SKILLS_DIR.exists():
+        return
+
+    for src in sorted(BUILTIN_SKILLS_DIR.glob("*.md")):
+        dst = SKILLS_DIR / src.name
+        if not dst.exists():
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def load_all_skills() -> str:
@@ -31,6 +48,7 @@ def load_all_skills() -> str:
     Returns an empty string if no skills are present.
     """
     _ensure_skills_dir()
+    _seed_builtin_skills()
     skill_files = sorted(SKILLS_DIR.glob("*.md"))
     if not skill_files:
         return ""
@@ -83,6 +101,7 @@ def sync_skills_from_drive() -> int:
         (SKILLS_DIR / local_name).write_bytes(data)
         count += 1
 
+    _seed_builtin_skills()
     return count
 
 
