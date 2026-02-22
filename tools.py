@@ -8,11 +8,16 @@ docstrings precise - they become the tool descriptions the LLM sees.
 
 import asyncio
 from contextvars import ContextVar
+import io
+import json
 import os
+from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import time
 from typing import Any
 
 import httpx
@@ -26,6 +31,7 @@ _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 TASK_COMPLETE_PREFIX = "TASK COMPLETE:"
 _SESSION_ID_CTX: ContextVar[str] = ContextVar("nanobot_session_id", default="default")
 _TODOS_BY_SESSION: dict[str, list[dict[str, str]]] = {}
+_SUBAGENT_DEPTH_CTX: ContextVar[int] = ContextVar("nanobot_subagent_depth", default=0)
 
 # Commands that are never allowed
 _BLOCKED = re.compile(
@@ -117,6 +123,22 @@ def _has_incomplete_todos(session_id: str) -> bool:
 
 def _session_has_incomplete_todos() -> bool:
     return _has_incomplete_todos(_active_session_id())
+
+
+def _workspace_root() -> Path:
+    configured = _get_system_secret("workspace_root", "")
+    root = Path(configured).expanduser() if configured else Path("/tmp/workspace")
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
+
+
+def _resolve_workspace_path(path: str) -> Path:
+    rel = (path or ".").strip()
+    root = _workspace_root()
+    target = (root / rel).resolve() if not Path(rel).is_absolute() else Path(rel).resolve()
+    if root not in [target, *target.parents]:
+        raise ValueError(f"Path is outside workspace root: {target}")
+    return target
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +793,341 @@ async def done(message: str) -> str:
     :param message: Final completion summary.
     """
     return f"{TASK_COMPLETE_PREFIX} {message}".strip()
+
+
+# ---------------------------------------------------------------------------
+# Unsafe Python executor (approved fast path)
+# ---------------------------------------------------------------------------
+
+def python_exec_unsafe(code: str) -> str:
+    """
+    Execute Python code directly in-process and return captured stdout.
+
+    WARNING: This is intentionally unsafe and should only be used in trusted
+    environments.
+
+    :param code: Python source code to execute.
+    """
+    old_stdout = sys.stdout
+    new_stdout = io.StringIO()
+    sys.stdout = new_stdout
+    execution_context: dict[str, Any] = {}
+    try:
+        exec(code, {"__builtins__": __builtins__}, execution_context)
+        output = new_stdout.getvalue()
+        return output or "(no output)"
+    except Exception as exc:
+        return f"Execution error: {exc}"
+    finally:
+        sys.stdout = old_stdout
+
+
+# ---------------------------------------------------------------------------
+# Workspace file tools (restricted to workspace root)
+# ---------------------------------------------------------------------------
+
+def list_dir(path: str = ".", recursive: bool = False, max_entries: int = 200) -> str:
+    """
+    List files/directories inside the configured workspace root.
+
+    :param path: Relative path inside workspace.
+    :param recursive: Include nested entries.
+    :param max_entries: Maximum entries to return.
+    """
+    try:
+        target = _resolve_workspace_path(path)
+        if not target.exists():
+            return f"Path not found: {target}"
+        if not target.is_dir():
+            return f"Not a directory: {target}"
+
+        lines: list[str] = []
+        iterator = target.rglob("*") if recursive else target.iterdir()
+        for i, entry in enumerate(sorted(iterator), 1):
+            if i > max(max_entries, 1):
+                lines.append("... (truncated)")
+                break
+            kind = "dir" if entry.is_dir() else "file"
+            rel = entry.relative_to(_workspace_root())
+            lines.append(f"- [{kind}] {rel}")
+        return "\n".join(lines) if lines else "(empty directory)"
+    except Exception as exc:
+        return f"Error listing directory: {exc}"
+
+
+def read_file(path: str, max_chars: int = 12000) -> str:
+    """
+    Read a UTF-8 text file from workspace.
+
+    :param path: Relative file path inside workspace.
+    :param max_chars: Maximum chars to return.
+    """
+    try:
+        target = _resolve_workspace_path(path)
+        if not target.exists():
+            return f"File not found: {target}"
+        if not target.is_file():
+            return f"Not a file: {target}"
+        text = target.read_text(encoding="utf-8")
+        return _truncate(text, max_chars)
+    except Exception as exc:
+        return f"Error reading file: {exc}"
+
+
+def write_file(path: str, content: str, append: bool = False) -> str:
+    """
+    Write text to a workspace file.
+
+    :param path: Relative file path inside workspace.
+    :param content: Text content to write.
+    :param append: If true, append instead of overwrite.
+    """
+    try:
+        target = _resolve_workspace_path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if append:
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write(content)
+        else:
+            target.write_text(content, encoding="utf-8")
+        return f"Wrote file: {target}"
+    except Exception as exc:
+        return f"Error writing file: {exc}"
+
+
+def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
+    """
+    Replace text in a workspace file.
+
+    :param path: Relative file path inside workspace.
+    :param old_text: Text to find.
+    :param new_text: Replacement text.
+    :param replace_all: Replace all occurrences if true.
+    """
+    try:
+        target = _resolve_workspace_path(path)
+        if not target.exists() or not target.is_file():
+            return f"File not found: {target}"
+        text = target.read_text(encoding="utf-8")
+        if old_text not in text:
+            return "No matching text found."
+        if replace_all:
+            count = text.count(old_text)
+            updated = text.replace(old_text, new_text)
+        else:
+            count = 1
+            updated = text.replace(old_text, new_text, 1)
+        target.write_text(updated, encoding="utf-8")
+        return f"Updated file {target} ({count} replacement(s))."
+    except Exception as exc:
+        return f"Error editing file: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Subagent spawning
+# ---------------------------------------------------------------------------
+
+async def spawn_subagent(task: str, prefix: str = "") -> str:
+    """
+    Spawn a delegated subagent run in a child session and return its result.
+
+    :param task: Task prompt for the subagent.
+    :param prefix: Optional extra context prepended to the task.
+    """
+    depth = _SUBAGENT_DEPTH_CTX.get()
+    if depth >= 1:
+        return "Error: subagent nesting depth exceeded."
+
+    if not task.strip():
+        return "Error: task is required."
+
+    from agent import Agent
+    from session import Session
+
+    parent = _active_session_id()
+    child_id = f"sub_{parent}_{int(time.time())}"
+    child_prompt = f"{prefix.strip()}\n\n{task}".strip() if prefix.strip() else task
+
+    token = _SUBAGENT_DEPTH_CTX.set(depth + 1)
+    try:
+        child_session = Session(child_id)
+        child_agent = Agent(child_session)
+        result = await child_agent.run(child_prompt)
+        return (
+            f"Subagent session: {child_id}\n"
+            f"Task: {task}\n\n"
+            f"Result:\n{result}"
+        )
+    finally:
+        _SUBAGENT_DEPTH_CTX.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Cron scheduling tools
+# ---------------------------------------------------------------------------
+
+def cron_create(name: str, prompt: str, interval_minutes: int, session_id: str = "") -> str:
+    """
+    Create a recurring cron task persisted in Drive.
+
+    :param name: Human-readable task name.
+    :param prompt: Prompt to run on each schedule tick.
+    :param interval_minutes: Interval in minutes (minimum 1).
+    :param session_id: Optional fixed session id; defaults to current session.
+    """
+    try:
+        import cron_service
+
+        target_session = session_id.strip() or _active_session_id()
+        task = cron_service.create_task(
+            name=name.strip(),
+            prompt=prompt,
+            interval_minutes=max(1, int(interval_minutes)),
+            session_id=target_session,
+        )
+        return (
+            f"Cron task created: {task['id']}\n"
+            f"name: {task['name']}\n"
+            f"interval_minutes: {task['interval_minutes']}\n"
+            f"next_run_utc: {task['next_run_utc']}"
+        )
+    except Exception as exc:
+        return f"Error creating cron task: {exc}"
+
+
+def cron_list() -> str:
+    """
+    List configured cron tasks.
+    """
+    try:
+        import cron_service
+
+        tasks = cron_service.list_tasks()
+        if not tasks:
+            return "No cron tasks configured."
+        lines: list[str] = []
+        for t in tasks:
+            lines.append(
+                f"- id={t.get('id','')} name={t.get('name','')} "
+                f"every={t.get('interval_minutes','?')}m next={t.get('next_run_utc','')}"
+            )
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Error listing cron tasks: {exc}"
+
+
+def cron_delete(task_id: str) -> str:
+    """
+    Delete a cron task by id.
+
+    :param task_id: Task id.
+    """
+    try:
+        import cron_service
+
+        removed = cron_service.delete_task(task_id.strip())
+        if removed:
+            return f"Cron task deleted: {task_id}"
+        return f"Cron task not found: {task_id}"
+    except Exception as exc:
+        return f"Error deleting cron task: {exc}"
+
+
+async def cron_run_due(limit: int = 3) -> str:
+    """
+    Execute due cron tasks now and reschedule them.
+
+    :param limit: Maximum due tasks to run this invocation.
+    """
+    try:
+        import cron_service
+
+        results = await cron_service.run_due_tasks(limit=max(1, int(limit)))
+        if not results:
+            return "No due cron tasks."
+        blocks: list[str] = []
+        for r in results:
+            blocks.append(
+                f"- id={r.get('id','')} status={r.get('status','ok')} next={r.get('next_run_utc','')}\n"
+                f"  result={_truncate(str(r.get('result','')), 600)}"
+            )
+        return "\n".join(blocks)
+    except Exception as exc:
+        return f"Error running due cron tasks: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# MCP bridge tools
+# ---------------------------------------------------------------------------
+
+def _mcp_servers() -> dict[str, dict[str, Any]]:
+    raw = st.secrets.get("mcp_servers", {})
+    if isinstance(raw, dict):
+        result: dict[str, dict[str, Any]] = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                result[str(k)] = dict(v)
+        return result
+    return {}
+
+
+def mcp_list_servers() -> str:
+    """
+    List configured MCP bridge servers from secrets.
+    """
+    servers = _mcp_servers()
+    if not servers:
+        return "No MCP servers configured. Add [mcp_servers.<name>] with url in secrets."
+    lines = []
+    for name, cfg in servers.items():
+        lines.append(f"- {name}: {cfg.get('url', '(missing url)')}")
+    return "\n".join(lines)
+
+
+async def mcp_call(server: str, tool_name: str, arguments_json: str = "{}") -> str:
+    """
+    Call a configured MCP bridge server over HTTP JSON.
+
+    :param server: MCP server name from secrets.
+    :param tool_name: Remote tool name.
+    :param arguments_json: JSON object string of tool arguments.
+    """
+    servers = _mcp_servers()
+    cfg = servers.get(server)
+    if cfg is None:
+        return f"Unknown MCP server: {server}"
+
+    url = str(cfg.get("url", "")).strip()
+    if not url:
+        return f"MCP server '{server}' is missing url."
+
+    token = str(cfg.get("token", "")).strip()
+    try:
+        args = json.loads(arguments_json or "{}")
+    except json.JSONDecodeError as exc:
+        return f"Invalid arguments_json: {exc}"
+
+    payload = {
+        "tool": tool_name,
+        "arguments": args,
+        "session_id": _active_session_id(),
+    }
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code >= 400:
+            return f"MCP error ({resp.status_code}): {_truncate(resp.text, 1200)}"
+        try:
+            data = resp.json()
+            return _truncate(json.dumps(data, ensure_ascii=False, indent=2), 12000)
+        except Exception:
+            return _truncate(resp.text, 12000)
+    except Exception as exc:
+        return f"Error calling MCP server '{server}': {exc}"
 
 
 # ---------------------------------------------------------------------------

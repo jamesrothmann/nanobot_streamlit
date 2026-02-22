@@ -19,6 +19,7 @@ from typing import Any, Callable
 import llm as llm_module
 import tools as tools_module
 import gworkspace as gworkspace_module
+import streamlit as st
 from session import Session
 
 MAX_TOOL_ITERATIONS = 25
@@ -28,6 +29,13 @@ Provide a concise summary with:
 2) What remains incomplete
 3) Recommended next action
 Keep it brief and actionable."""
+COMPACTION_SUMMARY_PROMPT = """Summarize this conversation so an agent can continue work without losing progress.
+Include:
+1) User objective
+2) Actions completed
+3) Open todos or blockers
+4) Exact next best step
+Keep it concise and actionable."""
 
 
 # ---------------------------------------------------------------------------
@@ -66,14 +74,20 @@ class Agent:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    async def run(self, user_message: str) -> str:
+    async def run(
+        self,
+        user_message: str,
+        on_event: Callable[[str], None] | None = None,
+    ) -> str:
         """
         Process a user message through the full agent loop and return the
         final text response.
 
         :param user_message: The raw text message from the user.
+        :param on_event: Optional callback for step/progress updates.
         """
         tools_module._set_active_session_id(self.session.session_id)
+        _emit(on_event, "Starting agent run.")
 
         # Persist user message
         self.session.add_message("user", user_message)
@@ -87,6 +101,11 @@ class Agent:
         incomplete_todos_prompted = False
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            messages = await _maybe_compact_messages(
+                session=self.session,
+                messages=messages,
+                on_event=on_event,
+            )
             response = await llm_module.chat_completion(messages, tools=_TOOL_SCHEMAS)
             text, tool_calls = llm_module.extract_response(response)
 
@@ -107,11 +126,13 @@ class Agent:
                             ),
                         }
                     )
+                    _emit(on_event, "Todos still incomplete; continuing execution.")
                     continue
 
                 # Final text response
                 final_text = text or "(no response)"
                 self.session.add_message("assistant", final_text)
+                _emit(on_event, "Agent run completed.")
                 return final_text
 
             # ----------------------------------------------------------------
@@ -140,6 +161,7 @@ class Agent:
             self.session.add_tool_call(messages[-1])
 
             for tc in tool_calls:
+                _emit(on_event, f"Tool call: {tc['name']}")
                 result = await _execute_tool(tc["name"], tc["arguments"])
                 tool_result_msg = {
                     "role": "tool",
@@ -149,15 +171,86 @@ class Agent:
                 }
                 messages.append(tool_result_msg)
                 self.session.add_tool_result(tc["id"], tc["name"], str(result))
+                _emit(on_event, f"Tool result: {tc['name']}")
 
                 done_text = _extract_done_message(tc["name"], str(result))
                 if done_text is not None:
                     self.session.add_message("assistant", done_text)
+                    _emit(on_event, "Task marked complete via done().")
                     return done_text
 
         final_text = await _summarize_max_iterations(messages)
         self.session.add_message("assistant", final_text)
+        _emit(on_event, "Max iterations reached; returned summary.")
         return final_text
+
+
+# ---------------------------------------------------------------------------
+# Loop helpers
+# ---------------------------------------------------------------------------
+
+def _emit(on_event: Callable[[str], None] | None, message: str) -> None:
+    if on_event is None:
+        return
+    try:
+        on_event(message)
+    except Exception:
+        pass
+
+
+def _estimate_context_chars(messages: list[dict[str, Any]]) -> int:
+    total = 0
+    for msg in messages:
+        total += len(str(msg.get("content", "")))
+        if "tool_calls" in msg:
+            total += len(str(msg.get("tool_calls", "")))
+    return total
+
+
+async def _maybe_compact_messages(
+    session: Session,
+    messages: list[dict[str, Any]],
+    on_event: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Compact long histories into a summary to avoid context blow-ups.
+    """
+    threshold = int(st.secrets.get("system", {}).get("compaction_threshold_chars", 60_000))
+    if _estimate_context_chars(messages) < max(10_000, threshold):
+        return messages
+
+    if not messages:
+        return messages
+
+    _emit(on_event, "Compacting conversation context...")
+    summary_messages = [
+        *messages,
+        {"role": "user", "content": COMPACTION_SUMMARY_PROMPT},
+    ]
+    try:
+        response = await llm_module.chat_completion(summary_messages, tools=None)
+        summary_text, _ = llm_module.extract_response(response)
+        summary = (summary_text or "").strip()
+        if not summary:
+            return messages
+
+        system_msg = messages[0]
+        compacted = [
+            system_msg,
+            {
+                "role": "user",
+                "content": (
+                    "Conversation continuation summary:\n"
+                    f"{summary}"
+                ),
+            },
+        ]
+        # Persist compacted non-system history for future turns.
+        session.replace_messages(compacted[1:])
+        _emit(on_event, "Context compacted.")
+        return compacted
+    except Exception:
+        return messages
 
 
 # ---------------------------------------------------------------------------

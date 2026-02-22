@@ -92,6 +92,15 @@ class Session:
         """
         return self._messages[-MAX_HISTORY_MESSAGES:]
 
+    def replace_messages(self, messages: list[dict[str, Any]]) -> None:
+        """
+        Replace full in-memory history and persist to Drive.
+
+        :param messages: Full message list to store.
+        """
+        self._messages = list(messages)
+        self._save()
+
     def clear(self) -> None:
         """Wipe the session history locally and on Drive."""
         self._messages = []

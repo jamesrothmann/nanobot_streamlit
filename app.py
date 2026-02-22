@@ -16,6 +16,7 @@ import streamlit as st
 import drive_sync
 from agent import Agent
 from session import Session
+import tools as tools_module
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -84,6 +85,17 @@ def _boot() -> bool:
         skills_module.sync_skills_from_drive()
     except Exception:
         pass
+
+    # Run due cron tasks on boot (optional)
+    try:
+        system_cfg = dict(st.secrets.get("system", {}))
+        run_on_boot = bool(system_cfg.get("cron_run_on_boot", True))
+        if run_on_boot:
+            import cron_service
+
+            cron_service.run_due_tasks_sync(limit=3)
+    except Exception as exc:
+        st.warning(f"Cron runner warning: {exc}")
 
     # Start Telegram bot in a background daemon thread (optional)
     try:
@@ -174,11 +186,35 @@ if prompt := st.chat_input("Message Nanobot…"):
 
     # Run agent
     with st.chat_message("assistant"):
+        progress_box = st.empty()
+        progress_lines: list[str] = []
+
+        def _on_progress(event: str) -> None:
+            progress_lines.append(event)
+            tail = progress_lines[-8:]
+            progress_box.markdown("**Progress**\n" + "\n".join(f"- {x}" for x in tail))
+
         with st.spinner("Thinking…"):
             session: Session = st.session_state["session"]
             agent = Agent(session)
-            response = asyncio.run(agent.run(prompt))
+            response = asyncio.run(agent.run(prompt, on_event=_on_progress))
+
+        progress_box.empty()
 
         st.markdown(response)
 
     st.session_state["messages"].append({"role": "assistant", "content": response})
+
+
+st.divider()
+with st.expander("Python Code Executor (Unsafe)"):
+    st.caption("Approved fast-path executor. Runs code directly in-process. Use only in trusted environments.")
+    exec_code = st.text_area(
+        "Enter Python code:",
+        height=220,
+        key="unsafe_python_executor_input",
+        value="print('Hello from Nanobot executor')",
+    )
+    if st.button("Execute Code", key="unsafe_python_execute_button"):
+        output = tools_module.python_exec_unsafe(exec_code)
+        st.code(output, language="text")

@@ -6,7 +6,10 @@ description: Cloud browser automation via Steel.dev sessions and agent-browser C
 # Steel + agent-browser Workflow
 
 Use Steel as fallback or when explicitly requested.
+<<<<<<< HEAD
 Also load and follow the `agent-browser` skill for command-level interaction patterns.
+=======
+>>>>>>> 51fb39dfc197a1edee6e1ae0b6987a81b46b861c
 
 1. `steel_create_session`
 2. `steel_agent_browser` for commands against the returned CDP URL
@@ -22,3 +25,7 @@ Also load and follow the `agent-browser` skill for command-level interaction pat
 ## Fast Path
 
 For URL-first tasks where Jina may fail, use `browse_jina_then_steel`. It tries Jina Reader first and automatically falls back to a temporary Steel session if needed.
+<<<<<<< HEAD
+=======
+
+>>>>>>> 51fb39dfc197a1edee6e1ae0b6987a81b46b861c
