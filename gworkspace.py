@@ -195,6 +195,201 @@ def google_workspace_identity() -> str:
 
 
 # ---------------------------------------------------------------------------
+# OAuth onboarding (chat-driven, no local script required)
+# ---------------------------------------------------------------------------
+
+def _oauth_scope_string() -> str:
+    return " ".join(_OAUTH_ONBOARDING_SCOPES)
+
+
+def _oauth_client_credentials(client_id: str, client_secret: str) -> tuple[str, str]:
+    cfg = _google_oauth_info()
+    cid = client_id.strip() or str(cfg.get("client_id", "")).strip()
+    csec = client_secret.strip() or str(cfg.get("client_secret", "")).strip()
+    return cid, csec
+
+
+def google_oauth_onboarding_start(
+    client_id: str = "",
+    client_secret: str = "",
+    user_email: str = "",
+) -> str:
+    """
+    Start one-time Google OAuth onboarding using the device flow.
+
+    This is designed for Streamlit Cloud where running local scripts is not convenient.
+    It returns a verification URL + user code and an onboarding_id for follow-up.
+
+    :param client_id: OAuth client ID (optional if already in [google_oauth]).
+    :param client_secret: OAuth client secret (optional if already in [google_oauth]).
+    :param user_email: Optional user email hint for generated secrets block.
+    """
+    cid, csec = _oauth_client_credentials(client_id, client_secret)
+    if not cid or not csec:
+        return (
+            "Missing OAuth client credentials. Provide client_id/client_secret in this tool call "
+            "or set them in [google_oauth] secrets first."
+        )
+
+    payload = {
+        "client_id": cid,
+        "scope": _oauth_scope_string(),
+    }
+
+    try:
+        with httpx.Client(timeout=20, follow_redirects=True) as client:
+            resp = client.post(_DEVICE_CODE_ENDPOINT, data=payload)
+        if resp.status_code >= 400:
+            return f"OAuth device start failed ({resp.status_code}): {resp.text}"
+        data = resp.json()
+    except Exception as exc:
+        return f"OAuth onboarding start error: {exc}"
+
+    onboarding_id = str(uuid.uuid4())[:8]
+    created = time.time()
+    _OAUTH_PENDING[onboarding_id] = {
+        "client_id": cid,
+        "client_secret": csec,
+        "user_email": user_email.strip(),
+        "device_code": str(data.get("device_code", "")),
+        "user_code": str(data.get("user_code", "")),
+        "verification_url": str(data.get("verification_url", "")),
+        "verification_uri_complete": str(data.get("verification_uri_complete", "")),
+        "expires_in": int(data.get("expires_in", 1800) or 1800),
+        "interval": int(data.get("interval", 5) or 5),
+        "created_at": created,
+    }
+
+    return (
+        "Google OAuth onboarding started.\n"
+        f"onboarding_id: {onboarding_id}\n"
+        f"verification_url: {data.get('verification_url', '')}\n"
+        f"user_code: {data.get('user_code', '')}\n"
+        f"verification_uri_complete: {data.get('verification_uri_complete', '')}\n\n"
+        "Next step:\n"
+        "1) Open verification_url (or verification_uri_complete)\n"
+        "2) Approve access\n"
+        f"3) Ask me to run google_oauth_onboarding_finish(onboarding_id='{onboarding_id}')"
+    )
+
+
+def google_oauth_onboarding_status(onboarding_id: str) -> str:
+    """
+    Check onboarding flow state by onboarding_id.
+
+    :param onboarding_id: ID returned from google_oauth_onboarding_start.
+    """
+    flow = _OAUTH_PENDING.get(onboarding_id.strip())
+    if flow is None:
+        return f"Unknown onboarding_id: {onboarding_id}"
+    age = int(max(0, time.time() - float(flow.get("created_at", 0))))
+    ttl = int(flow.get("expires_in", 1800))
+    remaining = max(0, ttl - age)
+    return (
+        f"onboarding_id: {onboarding_id}\n"
+        f"user_code: {flow.get('user_code', '')}\n"
+        f"verification_url: {flow.get('verification_url', '')}\n"
+        f"seconds_remaining: {remaining}"
+    )
+
+
+def google_oauth_onboarding_finish(onboarding_id: str, wait_seconds: int = 120) -> str:
+    """
+    Complete onboarding and return copy/paste secrets block with refresh token.
+
+    Polls token endpoint for up to wait_seconds.
+
+    :param onboarding_id: ID returned from google_oauth_onboarding_start.
+    :param wait_seconds: Max seconds to poll for approval completion.
+    """
+    flow = _OAUTH_PENDING.get(onboarding_id.strip())
+    if flow is None:
+        return f"Unknown onboarding_id: {onboarding_id}"
+
+    now = time.time()
+    created = float(flow.get("created_at", 0))
+    expires_in = int(flow.get("expires_in", 1800))
+    if now > created + expires_in:
+        _OAUTH_PENDING.pop(onboarding_id.strip(), None)
+        return "OAuth onboarding expired. Start again with google_oauth_onboarding_start."
+
+    interval = max(1, int(flow.get("interval", 5)))
+    deadline = now + max(5, int(wait_seconds))
+    device_code = str(flow.get("device_code", ""))
+    cid = str(flow.get("client_id", ""))
+    csec = str(flow.get("client_secret", ""))
+
+    token_data: dict[str, Any] | None = None
+    with httpx.Client(timeout=20, follow_redirects=True) as client:
+        while time.time() <= deadline:
+            payload = {
+                "client_id": cid,
+                "client_secret": csec,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            }
+            try:
+                resp = client.post(_TOKEN_ENDPOINT, data=payload)
+            except Exception as exc:
+                return f"OAuth onboarding finish error: {exc}"
+
+            if resp.status_code < 400:
+                token_data = resp.json()
+                break
+
+            try:
+                err = resp.json().get("error", "")
+            except Exception:
+                err = ""
+
+            if err == "authorization_pending":
+                time.sleep(interval)
+                continue
+            if err == "slow_down":
+                interval += 2
+                time.sleep(interval)
+                continue
+            if err == "access_denied":
+                return "OAuth access denied by user."
+            if err == "expired_token":
+                _OAUTH_PENDING.pop(onboarding_id.strip(), None)
+                return "OAuth onboarding expired. Start again."
+            return f"OAuth token exchange failed ({resp.status_code}): {resp.text}"
+
+    if token_data is None:
+        return (
+            "Still waiting for approval. Complete consent in browser and call "
+            f"google_oauth_onboarding_finish(onboarding_id='{onboarding_id}') again."
+        )
+
+    refresh_token = str(token_data.get("refresh_token", "")).strip()
+    if not refresh_token:
+        return (
+            "No refresh token returned. Revoke existing app access in Google Account "
+            "permissions, then restart onboarding and grant consent again."
+        )
+
+    user_email = str(flow.get("user_email", "")).strip()
+    _OAUTH_PENDING.pop(onboarding_id.strip(), None)
+    lines = [
+        "[google_oauth]",
+        "enabled = true",
+        f'client_id = "{cid}"',
+        f'client_secret = "{csec}"',
+        f'refresh_token = "{refresh_token}"',
+        f'token_uri = "{_TOKEN_ENDPOINT}"',
+    ]
+    if user_email:
+        lines.append(f'user_email = "{user_email}"')
+
+    return (
+        "OAuth onboarding complete.\n\n"
+        "Copy and paste this into Streamlit secrets, then redeploy/restart:\n\n"
+        + "\n".join(lines)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Common helpers
 # ---------------------------------------------------------------------------
 
