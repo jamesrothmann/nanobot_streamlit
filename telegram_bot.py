@@ -37,7 +37,11 @@ logger = logging.getLogger(__name__)
 async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
     if not _is_allowed(update):
-        await update.message.reply_text("Sorry, you are not authorised to use this bot.")
+        uid = update.effective_user.id
+        uname = (update.effective_user.username or "(no username)")
+        await update.message.reply_text(
+            f"Unauthorized. Your Telegram id is `{uid}` and username is @{uname}."
+        )
         return
     await update.message.reply_text(
         "Hello! I'm your Nanobot assistant. Send me a message and I'll get to work."
@@ -47,7 +51,11 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all incoming text messages."""
     if not _is_allowed(update):
-        await update.message.reply_text("Unauthorised.")
+        uid = update.effective_user.id
+        uname = (update.effective_user.username or "(no username)")
+        await update.message.reply_text(
+            f"Unauthorized. Your Telegram id is `{uid}` and username is @{uname}."
+        )
         return
 
     user_id = update.effective_user.id
@@ -78,6 +86,24 @@ async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Auth helper
 # ---------------------------------------------------------------------------
 
+def _as_list(value) -> list[str]:
+    """
+    Normalize secrets values into a list of strings.
+
+    Accepts list/tuple/set, comma-separated strings, or single scalars.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if "," in text:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return [text]
+
+
 def _is_allowed(update: Update) -> bool:
     """
     Return True if sender is in configured allow-lists.
@@ -85,11 +111,18 @@ def _is_allowed(update: Update) -> bool:
     Supports:
       telegram.allowed_users: ["username_without_at", ...]
       telegram.allowed_user_ids: [123456789, ...]
+      telegram.allowed_user_id: 123456789
     """
     tg = dict(st.secrets.get("telegram", {}))
 
-    allowed_users = {str(u).lstrip("@").strip() for u in tg.get("allowed_users", []) if str(u).strip()}
-    allowed_ids = {str(i).strip() for i in tg.get("allowed_user_ids", []) if str(i).strip()}
+    allowed_users = {
+        str(u).lstrip("@").strip()
+        for u in _as_list(tg.get("allowed_users", []))
+        if str(u).strip()
+    }
+    allowed_ids_values = _as_list(tg.get("allowed_user_ids", []))
+    allowed_ids_values.extend(_as_list(tg.get("allowed_user_id", "")))
+    allowed_ids = {str(i).strip() for i in allowed_ids_values if str(i).strip()}
 
     username = (update.effective_user.username or "").lstrip("@").strip()
     user_id = str(update.effective_user.id or "").strip()
