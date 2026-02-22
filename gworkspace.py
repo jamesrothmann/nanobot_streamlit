@@ -6,10 +6,9 @@ as callable tools. Keep signatures simple and docstrings clear because they are
 converted into tool schemas at runtime.
 
 Delegation model:
-- If `gcp_service_account.delegated_user` is configured in Streamlit secrets,
-  all services impersonate that user (domain-wide delegation).
-- Otherwise, the raw service account identity is used and resources must be
-  explicitly shared with that service account email.
+- Preferred: OAuth user credentials in `[google_oauth]` (desktop flow bootstrap
+  once, then persistent refresh token in secrets).
+- Fallback: service account with optional domain-wide delegation.
 """
 
 from __future__ import annotations
@@ -17,10 +16,15 @@ from __future__ import annotations
 import base64
 import email.mime.text
 import json
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import streamlit as st
+from google.auth.transport.requests import Request
+from google.oauth2 import credentials as oauth_credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
@@ -46,13 +50,58 @@ _DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+_OAUTH_ONBOARDING_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+_DEVICE_CODE_ENDPOINT = "https://oauth2.googleapis.com/device/code"
+_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+_OAUTH_PENDING: dict[str, dict[str, Any]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Auth + service builders
 # ---------------------------------------------------------------------------
 
 def _service_account_info() -> dict[str, Any]:
-    return dict(st.secrets["gcp_service_account"])
+    raw = st.secrets.get("gcp_service_account", {})
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _google_oauth_info() -> dict[str, Any]:
+    raw = st.secrets.get("google_oauth", {})
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _oauth_enabled() -> bool:
+    cfg = _google_oauth_info()
+    if not bool(cfg.get("enabled", False)):
+        return False
+    required = ("client_id", "client_secret", "refresh_token")
+    return all(str(cfg.get(k, "")).strip() for k in required)
+
+
+def _build_oauth_creds(scopes: list[str]) -> oauth_credentials.Credentials:
+    cfg = _google_oauth_info()
+    user_info: dict[str, str] = {
+        "type": "authorized_user",
+        "client_id": str(cfg.get("client_id", "")).strip(),
+        "client_secret": str(cfg.get("client_secret", "")).strip(),
+        "refresh_token": str(cfg.get("refresh_token", "")).strip(),
+        "token_uri": str(cfg.get("token_uri", "https://oauth2.googleapis.com/token")).strip(),
+    }
+    access_token = str(cfg.get("access_token", "")).strip()
+    if access_token:
+        user_info["token"] = access_token
+
+    creds = oauth_credentials.Credentials.from_authorized_user_info(user_info, scopes=scopes)
+    if not creds.valid:
+        creds.refresh(Request())
+    return creds
 
 
 def _delegated_user() -> str:
@@ -67,8 +116,15 @@ def _delegated_user() -> str:
     return delegated
 
 
-def _build_creds(scopes: list[str]) -> service_account.Credentials:
+def _build_creds(scopes: list[str]) -> Any:
+    if _oauth_enabled():
+        return _build_oauth_creds(scopes)
+
     info = _service_account_info()
+    if not info:
+        raise ValueError(
+            "No Google credentials configured. Set [google_oauth] or [gcp_service_account] in secrets."
+        )
     creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     delegated = _delegated_user()
     if delegated:
@@ -112,6 +168,16 @@ def google_workspace_identity() -> str:
 
     Use this to diagnose access issues and verify impersonation mode.
     """
+    if _oauth_enabled():
+        oauth_cfg = _google_oauth_info()
+        user_hint = str(oauth_cfg.get("user_email", "")).strip() or "(not set)"
+        return (
+            "Mode: OAuth user credentials\n"
+            f"User hint: {user_hint}\n"
+            "Auth source: [google_oauth] in secrets\n"
+            "Behavior: Works as your user account across Gmail/Calendar/Drive/Docs/Sheets."
+        )
+
     info = _service_account_info()
     sa_email = str(info.get("client_email", ""))
     delegated = _delegated_user()
@@ -122,7 +188,7 @@ def google_workspace_identity() -> str:
             "Mode: Domain-wide delegation (impersonation)"
         )
     return (
-        f"Service account: {sa_email}\n"
+        f"Service account: {sa_email or '(missing)'}\n"
         "Delegated user: (not configured)\n"
         "Mode: Shared-resource only (share files/calendars/mailbox with service account)"
     )
