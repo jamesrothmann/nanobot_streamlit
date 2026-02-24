@@ -41,7 +41,11 @@ class Session:
 
     def _load(self) -> None:
         """Download the session JSONL from Drive and parse it."""
-        raw = drive_sync.read_file(self.filename)
+        try:
+            raw = drive_sync.read_file(self.filename)
+        except Exception:
+            local = self._local_path()
+            raw = local.read_text(encoding="utf-8") if local.exists() else ""
         messages = []
         for line in raw.splitlines():
             line = line.strip()
