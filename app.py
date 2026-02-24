@@ -230,6 +230,24 @@ def _handle_google_oauth_callback() -> None:
         "user_email": str(pending.get("user_email", "")).strip(),
     }
     st.session_state["google_oauth_runtime"] = runtime_cfg
+    bind_result = gworkspace_module.google_workspace_set_runtime_oauth(
+        client_id=runtime_cfg["client_id"],
+        client_secret=runtime_cfg["client_secret"],
+        refresh_token=runtime_cfg["refresh_token"],
+        user_email=runtime_cfg["user_email"],
+        token_uri=runtime_cfg["token_uri"],
+    )
+    if "set" not in bind_result.lower():
+        st.session_state["google_oauth_notice"] = {
+            "kind": "error",
+            "text": f"OAuth connected, but runtime binding failed: {bind_result}",
+        }
+        st.session_state.pop("google_oauth_pending", None)
+        if state:
+            _oauth_pending_store().pop(state, None)
+        _clear_oauth_query_params()
+        st.rerun()
+
     lines = [
         "[google_oauth]",
         "enabled = true",
@@ -243,34 +261,25 @@ def _handle_google_oauth_callback() -> None:
     st.session_state["google_oauth_secrets_block"] = "\n".join(lines)
     st.session_state["google_oauth_notice"] = {
         "kind": "success",
-        "text": "Google OAuth connected. Runtime credentials are active for this session.",
+        "text": "Google OAuth connected and bound to Google Workspace tools for this runtime.",
     }
     st.session_state.pop("google_oauth_pending", None)
     if state:
         _oauth_pending_store().pop(state, None)
-    try:
-        gworkspace_module.google_workspace_clear_cached_services()
-    except Exception:
-        pass
+    st.session_state.pop("google_oauth_diag", None)
     _clear_oauth_query_params()
     st.rerun()
 
 
 def _render_google_oauth_panel() -> None:
     oauth_cfg = dict(st.secrets.get("google_oauth", {}))
-    runtime_cfg = st.session_state.get("google_oauth_runtime", {})
 
-    connected = False
-    if isinstance(runtime_cfg, dict):
-        connected = bool(str(runtime_cfg.get("refresh_token", "")).strip())
-    if not connected:
-        required = ("enabled", "client_id", "client_secret", "refresh_token")
-        connected = (
-            bool(oauth_cfg.get("enabled", False))
-            and all(str(oauth_cfg.get(key, "")).strip() for key in required[1:])
-        )
-
+    identity_text = gworkspace_module.google_workspace_identity()
+    connected = identity_text.startswith("Mode: OAuth user credentials")
     st.write(f"Google OAuth: {'connected' if connected else 'not connected'}")
+    with st.expander("Active Google Identity", expanded=False):
+        st.code(identity_text, language="text")
+
     notice = st.session_state.get("google_oauth_notice")
     if isinstance(notice, dict) and notice.get("text"):
         text = str(notice["text"])
@@ -297,7 +306,11 @@ def _render_google_oauth_panel() -> None:
         value=default_redirect_uri,
         help="Must exactly match an authorized redirect URI in your Google OAuth web client.",
         key="oauth_redirect_uri",
+        placeholder="https://<your-app>.streamlit.app/",
     )
+    if not redirect_uri.strip():
+        st.warning("OAuth redirect URI is required to start the web flow.")
+
     if st.button("Start Google OAuth", use_container_width=True):
         ok, message = _start_google_oauth_web_flow(
             client_id=client_id,
@@ -321,6 +334,37 @@ def _render_google_oauth_panel() -> None:
     if secrets_block:
         st.caption("Persist this by pasting into Streamlit secrets:")
         st.code(secrets_block, language="toml")
+
+    c1, c2 = st.columns(2)
+    if c1.button("Verify Workspace Access", use_container_width=True):
+        diag = gworkspace_module.google_workspace_oauth_diagnostics()
+        st.session_state["google_oauth_diag"] = diag
+        if "gmail_profile_ok=True" in diag:
+            st.session_state["google_oauth_notice"] = {
+                "kind": "success",
+                "text": "Workspace verification succeeded (Gmail profile is reachable).",
+            }
+        else:
+            st.session_state["google_oauth_notice"] = {
+                "kind": "error",
+                "text": "Workspace verification failed. Open diagnostics below.",
+            }
+        st.rerun()
+
+    if c2.button("Disconnect Runtime OAuth", use_container_width=True):
+        gworkspace_module.google_workspace_clear_runtime_oauth()
+        st.session_state.pop("google_oauth_runtime", None)
+        st.session_state.pop("google_oauth_diag", None)
+        st.session_state["google_oauth_notice"] = {
+            "kind": "success",
+            "text": "Runtime OAuth disconnected.",
+        }
+        st.rerun()
+
+    diag_text = str(st.session_state.get("google_oauth_diag", "")).strip()
+    if diag_text:
+        with st.expander("OAuth Diagnostics", expanded=True):
+            st.code(diag_text, language="text")
 
 
 def _extract_tool_names(messages: list[dict]) -> list[str]:
@@ -743,6 +787,10 @@ with st.sidebar:
                 st.session_state["messages"] = []
                 st.rerun()
             if st.button("Logout", use_container_width=True):
+                try:
+                    gworkspace_module.google_workspace_clear_runtime_oauth()
+                except Exception:
+                    pass
                 st.session_state.clear()
                 st.rerun()
 
@@ -777,6 +825,19 @@ for msg in st.session_state["messages"]:
 
 # Chat input
 if prompt := st.chat_input("Message Nanobot…"):
+    runtime_cfg = st.session_state.get("google_oauth_runtime", {})
+    if isinstance(runtime_cfg, dict) and str(runtime_cfg.get("refresh_token", "")).strip():
+        try:
+            gworkspace_module.google_workspace_set_runtime_oauth(
+                client_id=str(runtime_cfg.get("client_id", "")),
+                client_secret=str(runtime_cfg.get("client_secret", "")),
+                refresh_token=str(runtime_cfg.get("refresh_token", "")),
+                user_email=str(runtime_cfg.get("user_email", "")),
+                token_uri=str(runtime_cfg.get("token_uri", _GOOGLE_TOKEN_ENDPOINT)),
+            )
+        except Exception:
+            pass
+
     session: Session = st.session_state["session"]
     start_index = len(session)
 

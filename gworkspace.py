@@ -67,6 +67,17 @@ _OAUTH_PENDING: dict[str, dict[str, Any]] = {}
 # Auth + service builders
 # ---------------------------------------------------------------------------
 
+@st.cache_resource
+def _runtime_oauth_store() -> dict[str, Any]:
+    """
+    Thread-safe enough process-local OAuth override storage.
+
+    Streamlit session state is not reliably available in worker threads used by
+    tool execution, so we keep a runtime copy here for Google tool calls.
+    """
+    return {}
+
+
 def _service_account_info() -> dict[str, Any]:
     raw = st.secrets.get("gcp_service_account", {})
     return dict(raw) if isinstance(raw, dict) else {}
@@ -76,16 +87,20 @@ def _google_oauth_info() -> dict[str, Any]:
     raw = st.secrets.get("google_oauth", {})
     cfg = dict(raw) if isinstance(raw, dict) else {}
 
-    # Runtime overrides let the sidebar OAuth flow activate immediately
-    # without requiring a redeploy before testing integrations.
-    runtime_cfg: dict[str, Any] = {}
-    try:
-        runtime_raw = st.session_state.get("google_oauth_runtime", {})
-        runtime_cfg = dict(runtime_raw) if isinstance(runtime_raw, dict) else {}
-    except Exception:
-        runtime_cfg = {}
+    runtime_cfg = _runtime_oauth_store()
     if runtime_cfg:
         cfg.update(runtime_cfg)
+
+    # Runtime overrides let the sidebar OAuth flow activate immediately
+    # without requiring a redeploy before testing integrations.
+    session_runtime: dict[str, Any] = {}
+    try:
+        runtime_raw = st.session_state.get("google_oauth_runtime", {})
+        session_runtime = dict(runtime_raw) if isinstance(runtime_raw, dict) else {}
+    except Exception:
+        session_runtime = {}
+    if session_runtime:
+        cfg.update(session_runtime)
     return cfg
 
 
@@ -174,6 +189,48 @@ def _drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def google_workspace_set_runtime_oauth(
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    user_email: str = "",
+    token_uri: str = _TOKEN_ENDPOINT,
+) -> str:
+    """
+    Set runtime OAuth credentials so Google tools can use them immediately.
+    """
+    cid = client_id.strip()
+    csec = client_secret.strip()
+    rtok = refresh_token.strip()
+    turi = (token_uri or _TOKEN_ENDPOINT).strip()
+    if not cid or not csec or not rtok:
+        return "Missing runtime OAuth fields: client_id, client_secret, refresh_token."
+
+    store = _runtime_oauth_store()
+    store.clear()
+    store.update(
+        {
+            "enabled": True,
+            "client_id": cid,
+            "client_secret": csec,
+            "refresh_token": rtok,
+            "token_uri": turi,
+            "user_email": user_email.strip(),
+        }
+    )
+    google_workspace_clear_cached_services()
+    return "Runtime OAuth credentials set."
+
+
+def google_workspace_clear_runtime_oauth() -> str:
+    """
+    Remove runtime OAuth overrides and clear cached service clients.
+    """
+    _runtime_oauth_store().clear()
+    google_workspace_clear_cached_services()
+    return "Runtime OAuth credentials cleared."
+
+
 def google_workspace_clear_cached_services() -> str:
     """
     Clear cached Google API clients so auth changes take effect immediately.
@@ -186,6 +243,43 @@ def google_workspace_clear_cached_services() -> str:
     return "Google Workspace service cache cleared."
 
 
+def google_workspace_oauth_diagnostics() -> str:
+    """
+    Validate current Google auth path and test Gmail API access.
+    """
+    cfg = _google_oauth_info()
+    runtime_present = bool(_runtime_oauth_store())
+    mode = "oauth" if _oauth_enabled() else "service_account"
+    lines = [
+        f"mode={mode}",
+        f"runtime_override={runtime_present}",
+        f"oauth_enabled={bool(cfg.get('enabled', False))}",
+        f"oauth_client_id_present={bool(str(cfg.get('client_id', '')).strip())}",
+        f"oauth_refresh_token_present={bool(str(cfg.get('refresh_token', '')).strip())}",
+    ]
+
+    try:
+        creds = _build_creds(_GMAIL_SCOPES)
+        lines.append(f"creds_valid={bool(getattr(creds, 'valid', False))}")
+        lines.append(f"creds_expired={bool(getattr(creds, 'expired', False))}")
+    except Exception as exc:
+        lines.append(f"creds_error={exc}")
+        return "\n".join(lines)
+
+    try:
+        service = _gmail_service()
+        profile = service.users().getProfile(userId="me").execute()
+        email_addr = str(profile.get("emailAddress", "")).strip()
+        messages_total = int(profile.get("messagesTotal", 0) or 0)
+        lines.append(f"gmail_profile_ok=True email={email_addr or '(unknown)'}")
+        lines.append(f"gmail_messages_total={messages_total}")
+    except Exception as exc:
+        lines.append(f"gmail_profile_ok=False error={exc}")
+        return "\n".join(lines)
+
+    return "\n".join(lines)
+
+
 def google_workspace_identity() -> str:
     """
     Return the active Google identity context (service account + delegated user).
@@ -195,10 +289,11 @@ def google_workspace_identity() -> str:
     if _oauth_enabled():
         oauth_cfg = _google_oauth_info()
         user_hint = str(oauth_cfg.get("user_email", "")).strip() or "(not set)"
+        auth_source = "runtime OAuth override" if bool(_runtime_oauth_store()) else "[google_oauth] in secrets"
         return (
             "Mode: OAuth user credentials\n"
             f"User hint: {user_hint}\n"
-            "Auth source: [google_oauth] in secrets\n"
+            f"Auth source: {auth_source}\n"
             "Behavior: Works as your user account across Gmail/Calendar/Drive/Docs/Sheets."
         )
 

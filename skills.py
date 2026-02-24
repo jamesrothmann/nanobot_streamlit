@@ -15,6 +15,8 @@ Each skill file should follow the convention:
 
 from pathlib import Path
 
+import streamlit as st
+
 # Skills are stored under /tmp/workspace/skills/
 SKILLS_DIR = Path("/tmp/workspace/skills")
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
@@ -53,8 +55,13 @@ def load_all_skills() -> str:
     if not skill_files:
         return ""
 
+    system_cfg = dict(st.secrets.get("system", {}))
+    include_chat_oauth_skill = bool(system_cfg.get("enable_chat_oauth_skill", False))
+
     parts: list[str] = []
     for path in skill_files:
+        if path.name == "google-oauth-onboarding.md" and not include_chat_oauth_skill:
+            continue
         content = path.read_text(encoding="utf-8").strip()
         if content:
             parts.append(content)

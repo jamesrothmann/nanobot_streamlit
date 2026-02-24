@@ -18,6 +18,7 @@ from typing import Any, Callable
 import litellm
 import streamlit as st
 
+import gworkspace as gworkspace_module
 import memory
 import skills as skills_module
 
@@ -113,6 +114,24 @@ def build_system_prompt() -> str:
     skills_text = skills_module.load_all_skills()
     if skills_text.strip():
         parts.append(f"# Available Skills\n{skills_text}")
+
+    identity = "(unavailable)"
+    try:
+        identity = gworkspace_module.google_workspace_identity()
+    except Exception:
+        identity = "(unavailable)"
+
+    parts.append(
+        "\n".join(
+            [
+                "# Google Workspace Execution Rules",
+                "- If a user asks for Gmail/Calendar/Drive/Docs/Sheets actions, call the relevant Google tool first.",
+                "- Do not ask users to paste OAuth secrets into chat.",
+                "- Only request OAuth setup after a tool call returns an auth/config error.",
+                f"- Current auth context:\n{identity}",
+            ]
+        )
+    )
 
     return "\n\n---\n\n".join(p for p in parts if p.strip())
 
