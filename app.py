@@ -16,7 +16,6 @@ import streamlit as st
 import drive_sync
 from agent import Agent
 from session import Session
-import tools as tools_module
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -204,17 +203,3 @@ if prompt := st.chat_input("Message Nanobot…"):
         st.markdown(response)
 
     st.session_state["messages"].append({"role": "assistant", "content": response})
-
-
-st.divider()
-with st.expander("Python Code Executor (Unsafe)"):
-    st.caption("Approved fast-path executor. Runs code directly in-process. Use only in trusted environments.")
-    exec_code = st.text_area(
-        "Enter Python code:",
-        height=220,
-        key="unsafe_python_executor_input",
-        value="print('Hello from Nanobot executor')",
-    )
-    if st.button("Execute Code", key="unsafe_python_execute_button"):
-        output = tools_module.python_exec_unsafe(exec_code)
-        st.code(output, language="text")
