@@ -74,7 +74,19 @@ def _service_account_info() -> dict[str, Any]:
 
 def _google_oauth_info() -> dict[str, Any]:
     raw = st.secrets.get("google_oauth", {})
-    return dict(raw) if isinstance(raw, dict) else {}
+    cfg = dict(raw) if isinstance(raw, dict) else {}
+
+    # Runtime overrides let the sidebar OAuth flow activate immediately
+    # without requiring a redeploy before testing integrations.
+    runtime_cfg: dict[str, Any] = {}
+    try:
+        runtime_raw = st.session_state.get("google_oauth_runtime", {})
+        runtime_cfg = dict(runtime_raw) if isinstance(runtime_raw, dict) else {}
+    except Exception:
+        runtime_cfg = {}
+    if runtime_cfg:
+        cfg.update(runtime_cfg)
+    return cfg
 
 
 def _oauth_enabled() -> bool:
@@ -160,6 +172,18 @@ def _sheets_service():
 def _drive_service():
     creds = _build_creds(_DRIVE_SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def google_workspace_clear_cached_services() -> str:
+    """
+    Clear cached Google API clients so auth changes take effect immediately.
+    """
+    for service_fn in (_gmail_service, _calendar_service, _docs_service, _sheets_service, _drive_service):
+        try:
+            service_fn.clear()
+        except Exception:
+            pass
+    return "Google Workspace service cache cleared."
 
 
 def google_workspace_identity() -> str:
