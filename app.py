@@ -9,6 +9,8 @@ Boot sequence:
 """
 
 import asyncio
+import json
+import re
 import threading
 import time
 import uuid
@@ -17,6 +19,8 @@ from urllib.parse import urlencode
 import httpx
 import streamlit as st
 
+import capabilities as capabilities_module
+import cron_service
 import drive_sync
 import gworkspace as gworkspace_module
 import memory as mem_module
@@ -44,6 +48,15 @@ _GOOGLE_OAUTH_SCOPES = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
+
+
+@st.cache_resource
+def _oauth_pending_store() -> dict[str, dict[str, str]]:
+    """
+    Shared pending OAuth records keyed by state so callback can recover even
+    if browser session state is lost between redirect hops.
+    """
+    return {}
 
 
 def _query_param(key: str) -> str:
@@ -81,6 +94,12 @@ def _start_google_oauth_web_flow(
         "state": state,
         "created_at": time.time(),
     }
+    _oauth_pending_store()[state] = {
+        "client_id": cid,
+        "client_secret": csec,
+        "redirect_uri": ruri,
+        "user_email": user_email.strip(),
+    }
     params = {
         "client_id": cid,
         "redirect_uri": ruri,
@@ -114,23 +133,45 @@ def _handle_google_oauth_callback() -> None:
         return
 
     pending = st.session_state.get("google_oauth_pending")
-    if not isinstance(pending, dict):
-        st.session_state["google_oauth_notice"] = {
-            "kind": "error",
-            "text": "OAuth callback received, but no pending login request was found.",
-        }
-        _clear_oauth_query_params()
-        st.rerun()
+    pending_state = str(pending.get("state", "")).strip() if isinstance(pending, dict) else ""
+    store = _oauth_pending_store()
+    fallback = store.get(state, {}) if state else {}
 
-    expected_state = str(pending.get("state", "")).strip()
-    if not expected_state or state != expected_state:
-        st.session_state["google_oauth_notice"] = {
-            "kind": "error",
-            "text": "OAuth state mismatch. Start the login flow again.",
+    if not isinstance(pending, dict) or not pending_state:
+        if not isinstance(fallback, dict) or not fallback:
+            st.session_state["google_oauth_notice"] = {
+                "kind": "error",
+                "text": "OAuth callback received, but no pending login request was found.",
+            }
+            _clear_oauth_query_params()
+            st.rerun()
+        pending = {
+            "client_id": str(fallback.get("client_id", "")).strip(),
+            "client_secret": str(fallback.get("client_secret", "")).strip(),
+            "redirect_uri": str(fallback.get("redirect_uri", "")).strip(),
+            "user_email": str(fallback.get("user_email", "")).strip(),
+            "state": state,
         }
-        st.session_state.pop("google_oauth_pending", None)
-        _clear_oauth_query_params()
-        st.rerun()
+        st.session_state["google_oauth_pending"] = pending
+        pending_state = state
+
+    if not pending_state or state != pending_state:
+        if not isinstance(fallback, dict) or not fallback:
+            st.session_state["google_oauth_notice"] = {
+                "kind": "error",
+                "text": "OAuth state mismatch. Start the login flow again.",
+            }
+            st.session_state.pop("google_oauth_pending", None)
+            _clear_oauth_query_params()
+            st.rerun()
+        pending = {
+            "client_id": str(fallback.get("client_id", "")).strip(),
+            "client_secret": str(fallback.get("client_secret", "")).strip(),
+            "redirect_uri": str(fallback.get("redirect_uri", "")).strip(),
+            "user_email": str(fallback.get("user_email", "")).strip(),
+            "state": state,
+        }
+        st.session_state["google_oauth_pending"] = pending
 
     payload = {
         "client_id": str(pending.get("client_id", "")).strip(),
@@ -149,6 +190,8 @@ def _handle_google_oauth_callback() -> None:
                 "text": f"OAuth token exchange failed ({resp.status_code}): {resp.text}",
             }
             st.session_state.pop("google_oauth_pending", None)
+            if state:
+                _oauth_pending_store().pop(state, None)
             _clear_oauth_query_params()
             st.rerun()
     except Exception as exc:
@@ -157,6 +200,8 @@ def _handle_google_oauth_callback() -> None:
             "text": f"OAuth token exchange error: {exc}",
         }
         st.session_state.pop("google_oauth_pending", None)
+        if state:
+            _oauth_pending_store().pop(state, None)
         _clear_oauth_query_params()
         st.rerun()
 
@@ -171,6 +216,8 @@ def _handle_google_oauth_callback() -> None:
             ),
         }
         st.session_state.pop("google_oauth_pending", None)
+        if state:
+            _oauth_pending_store().pop(state, None)
         _clear_oauth_query_params()
         st.rerun()
 
@@ -199,6 +246,8 @@ def _handle_google_oauth_callback() -> None:
         "text": "Google OAuth connected. Runtime credentials are active for this session.",
     }
     st.session_state.pop("google_oauth_pending", None)
+    if state:
+        _oauth_pending_store().pop(state, None)
     try:
         gworkspace_module.google_workspace_clear_cached_services()
     except Exception:
@@ -272,6 +321,302 @@ def _render_google_oauth_panel() -> None:
     if secrets_block:
         st.caption("Persist this by pasting into Streamlit secrets:")
         st.code(secrets_block, language="toml")
+
+
+def _extract_tool_names(messages: list[dict]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        name = str(msg.get("name", "")).strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    if names:
+        return names
+
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []) or []:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            name = str(fn.get("name", "")).strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+def _capture_latest_run(
+    session: Session,
+    start_index: int,
+    user_prompt: str,
+    response: str,
+    origin: str,
+) -> None:
+    new_entries = session.get_messages_since(start_index)
+    st.session_state["latest_agent_run"] = {
+        "run_id": str(uuid.uuid4())[:10],
+        "origin": origin,
+        "user_prompt": user_prompt,
+        "response": response,
+        "tool_names": _extract_tool_names(new_entries),
+        "created_at": time.time(),
+    }
+
+
+def _default_capability_name(prompt: str) -> str:
+    tokens = [tok for tok in re.sub(r"[^a-zA-Z0-9\s]", " ", prompt or "").split() if tok.strip()]
+    if not tokens:
+        return "New Capability"
+    return " ".join(tokens[:6]).title()
+
+
+def _parse_defaults_json(raw: str) -> tuple[dict[str, str], str]:
+    text = (raw or "").strip()
+    if not text:
+        return {}, ""
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:
+        return {}, f"Invalid defaults JSON: {exc}"
+    if not isinstance(parsed, dict):
+        return {}, "Defaults must be a JSON object, for example: {\"project\": \"nanobot\"}"
+    return {str(k): str(v) for k, v in parsed.items()}, ""
+
+
+def _render_capabilities_panel(session_id: str) -> None:
+    latest = st.session_state.get("latest_agent_run", {})
+    if isinstance(latest, dict) and latest:
+        latest_run_id = str(latest.get("run_id", "")).strip()
+        if latest_run_id and st.session_state.get("cap_draft_source_run_id") != latest_run_id:
+            st.session_state["cap_draft_source_run_id"] = latest_run_id
+            st.session_state["cap_draft_name"] = _default_capability_name(str(latest.get("user_prompt", "")))
+            st.session_state["cap_draft_template"] = str(latest.get("user_prompt", "")).strip()
+            st.session_state["cap_draft_description"] = f"Promoted from {latest.get('origin', 'chat')}."
+            st.session_state["cap_draft_defaults"] = "{}"
+
+        st.caption(f"Latest run source: `{latest.get('origin', 'chat')}`")
+        tools_used = latest.get("tool_names", [])
+        if isinstance(tools_used, list) and tools_used:
+            st.caption("Tools used: " + ", ".join(str(x) for x in tools_used))
+        st.caption("Latest prompt")
+        st.code(str(latest.get("user_prompt", "")), language="text")
+    else:
+        st.caption("Run a task in chat first, then promote it to a reusable capability.")
+
+    st.markdown("**Promote to Capability**")
+    st.text_input("Capability name", key="cap_draft_name")
+    st.text_area(
+        "Prompt template (`{{variable}}` supported)",
+        key="cap_draft_template",
+        height=120,
+    )
+    st.text_input("Description (optional)", key="cap_draft_description")
+    st.text_area(
+        "Default variables JSON (optional)",
+        key="cap_draft_defaults",
+        height=70,
+        help='Example: {"project":"nanobot","minutes":"30"}',
+    )
+    if st.button("Save Capability", use_container_width=True):
+        name = str(st.session_state.get("cap_draft_name", "")).strip()
+        template = str(st.session_state.get("cap_draft_template", "")).strip()
+        description = str(st.session_state.get("cap_draft_description", "")).strip()
+        defaults_raw = str(st.session_state.get("cap_draft_defaults", "")).strip()
+        defaults, err = _parse_defaults_json(defaults_raw)
+        if err:
+            st.session_state["cap_notice"] = {"kind": "error", "text": err}
+            st.rerun()
+        if not name or not template:
+            st.session_state["cap_notice"] = {
+                "kind": "error",
+                "text": "Capability name and prompt template are required.",
+            }
+            st.rerun()
+
+        source_prompt = ""
+        source_tools: list[str] = []
+        if isinstance(latest, dict):
+            source_prompt = str(latest.get("user_prompt", "")).strip()
+            source_tools = [str(x) for x in latest.get("tool_names", []) or []]
+
+        saved = capabilities_module.create_capability(
+            name=name,
+            template=template,
+            description=description,
+            defaults=defaults,
+            source_prompt=source_prompt,
+            source_tools=source_tools,
+        )
+        st.session_state["cap_notice"] = {
+            "kind": "success",
+            "text": f"Saved capability: {saved.get('name', 'Unnamed')} ({saved.get('id', '')})",
+        }
+        st.rerun()
+
+    notice = st.session_state.get("cap_notice")
+    if isinstance(notice, dict) and notice.get("text"):
+        if notice.get("kind") == "success":
+            st.success(str(notice.get("text", "")))
+        else:
+            st.error(str(notice.get("text", "")))
+
+    capabilities = capabilities_module.list_capabilities()
+    if not capabilities:
+        st.info("No capabilities saved yet.")
+        return
+
+    st.divider()
+    st.markdown("**Run Capability**")
+    by_id = {
+        str(item.get("id", "")).strip(): item
+        for item in capabilities
+        if str(item.get("id", "")).strip()
+    }
+    capability_ids = list(by_id.keys())
+    selected_state = str(st.session_state.get("cap_selected_id", "")).strip()
+    if selected_state and selected_state not in capability_ids:
+        st.session_state["cap_selected_id"] = capability_ids[0]
+    selected_id = st.selectbox(
+        "Choose capability",
+        options=capability_ids,
+        format_func=lambda cid: f"{by_id[cid].get('name', 'Unnamed')} ({cid})",
+        key="cap_selected_id",
+    )
+    selected = by_id[selected_id]
+    template = str(selected.get("template", "")).strip()
+    defaults_raw = selected.get("defaults", {})
+    defaults = dict(defaults_raw) if isinstance(defaults_raw, dict) else {}
+    variables = capabilities_module.template_vars(template)
+
+    values: dict[str, str] = {}
+    for var in variables:
+        val = st.text_input(
+            f"Variable: {var}",
+            value=str(defaults.get(var, "")),
+            key=f"cap_var_{selected_id}_{var}",
+        )
+        values[var] = val
+
+    merged = dict(defaults)
+    merged.update({k: v for k, v in values.items() if str(v).strip()})
+    rendered_prompt, missing = capabilities_module.render_template(template, merged)
+
+    c1, c2 = st.columns(2)
+    if c1.button("Dry Run", use_container_width=True, key=f"cap_dry_{selected_id}"):
+        st.session_state["cap_preview"] = {
+            "id": selected_id,
+            "prompt": rendered_prompt,
+            "missing": missing,
+        }
+        st.rerun()
+    if c2.button("Prepare Run", use_container_width=True, key=f"cap_prepare_{selected_id}"):
+        if missing:
+            st.session_state["cap_notice"] = {
+                "kind": "error",
+                "text": f"Missing variables: {', '.join(missing)}",
+            }
+            st.rerun()
+        st.session_state["cap_pending_run"] = {
+            "id": selected_id,
+            "name": str(selected.get("name", "Unnamed")),
+            "prompt": rendered_prompt,
+        }
+        st.rerun()
+
+    preview = st.session_state.get("cap_preview", {})
+    if isinstance(preview, dict) and preview.get("id") == selected_id:
+        preview_missing = preview.get("missing", [])
+        if isinstance(preview_missing, list) and preview_missing:
+            st.warning("Missing variables: " + ", ".join(str(x) for x in preview_missing))
+        st.code(str(preview.get("prompt", "")), language="text")
+
+    pending = st.session_state.get("cap_pending_run", {})
+    if isinstance(pending, dict) and pending.get("id") == selected_id:
+        st.warning("Run is prepared. Confirm to execute this capability.")
+        st.code(str(pending.get("prompt", "")), language="text")
+        if st.button("Confirm Run", use_container_width=True, key=f"cap_confirm_{selected_id}"):
+            prompt = str(pending.get("prompt", "")).strip()
+            if not prompt:
+                st.session_state["cap_notice"] = {
+                    "kind": "error",
+                    "text": "Prepared prompt is empty.",
+                }
+                st.rerun()
+
+            with st.spinner("Running capability..."):
+                session: Session = st.session_state["session"]
+                start_index = len(session)
+                agent = Agent(session)
+                response = asyncio.run(agent.run(prompt))
+
+            st.session_state["messages"].append({"role": "user", "content": prompt})
+            st.session_state["messages"].append({"role": "assistant", "content": response})
+            _capture_latest_run(
+                session=st.session_state["session"],
+                start_index=start_index,
+                user_prompt=prompt,
+                response=response,
+                origin=f"capability:{pending.get('name', 'Unnamed')}",
+            )
+            st.session_state["cap_notice"] = {
+                "kind": "success",
+                "text": f"Executed capability: {pending.get('name', 'Unnamed')}",
+            }
+            st.session_state.pop("cap_pending_run", None)
+            st.rerun()
+
+    with st.expander("Schedule Capability (Optional)", expanded=False):
+        interval_minutes = int(
+            st.number_input(
+                "Every N minutes",
+                min_value=1,
+                value=60,
+                step=1,
+                key=f"cap_schedule_interval_{selected_id}",
+            )
+        )
+        default_task_name = f"Capability: {selected.get('name', 'Unnamed')}"
+        task_name = st.text_input(
+            "Task name",
+            value=default_task_name,
+            key=f"cap_schedule_name_{selected_id}",
+        )
+        if st.button("Create Schedule", use_container_width=True, key=f"cap_schedule_create_{selected_id}"):
+            scheduled_prompt, missing_sched = capabilities_module.render_template(template, merged)
+            if missing_sched:
+                st.session_state["cap_notice"] = {
+                    "kind": "error",
+                    "text": f"Cannot schedule with missing variables: {', '.join(missing_sched)}",
+                }
+                st.rerun()
+            task = cron_service.create_task(
+                name=task_name.strip() or default_task_name,
+                prompt=scheduled_prompt,
+                interval_minutes=interval_minutes,
+                session_id=session_id,
+            )
+            st.session_state["cap_notice"] = {
+                "kind": "success",
+                "text": f"Scheduled task created: {task.get('id', '')}",
+            }
+            st.rerun()
+
+    if st.button("Delete Capability", use_container_width=True, key=f"cap_delete_{selected_id}"):
+        ok = capabilities_module.delete_capability(selected_id)
+        st.session_state["cap_notice"] = {
+            "kind": "success" if ok else "error",
+            "text": (
+                f"Deleted capability: {selected.get('name', 'Unnamed')}"
+                if ok
+                else "Capability not found; nothing deleted."
+            ),
+        }
+        st.session_state.pop("cap_pending_run", None)
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +764,9 @@ with st.sidebar:
             st.subheader("Google OAuth")
             _render_google_oauth_panel()
 
+        with st.expander("Capabilities", expanded=False):
+            _render_capabilities_panel(session_id)
+
 # Render existing conversation
 for msg in st.session_state["messages"]:
     role = msg["role"]
@@ -429,6 +777,9 @@ for msg in st.session_state["messages"]:
 
 # Chat input
 if prompt := st.chat_input("Message Nanobot…"):
+    session: Session = st.session_state["session"]
+    start_index = len(session)
+
     # Display user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -445,7 +796,6 @@ if prompt := st.chat_input("Message Nanobot…"):
             progress_box.markdown("**Progress**\n" + "\n".join(f"- {x}" for x in tail))
 
         with st.spinner("Thinking…"):
-            session: Session = st.session_state["session"]
             agent = Agent(session)
             response = asyncio.run(agent.run(prompt, on_event=_on_progress))
 
@@ -454,3 +804,10 @@ if prompt := st.chat_input("Message Nanobot…"):
         st.markdown(response)
 
     st.session_state["messages"].append({"role": "assistant", "content": response})
+    _capture_latest_run(
+        session=session,
+        start_index=start_index,
+        user_prompt=prompt,
+        response=response,
+        origin="chat",
+    )

@@ -92,6 +92,13 @@ class Session:
         """
         return self._messages[-MAX_HISTORY_MESSAGES:]
 
+    def get_messages_since(self, start_index: int) -> list[dict[str, Any]]:
+        """
+        Return all messages appended at or after `start_index`.
+        """
+        idx = max(0, int(start_index))
+        return self._messages[idx:]
+
     def replace_messages(self, messages: list[dict[str, Any]]) -> None:
         """
         Replace full in-memory history and persist to Drive.
